@@ -52,6 +52,109 @@ factor() {
 	fi
 }
 
+# 辅助函数：在指定规则之前插入端口规则（支持大端口列表和冒号范围）
+add_port_rules_before() {
+	local ipt_cmd="$1"
+	local chain="$2" 
+	local target_rule="$3"
+	local rule_prefix="$4"
+	local ports="$5"
+	local rule_suffix="$6"
+	
+	# 如果没有端口限制，直接插入一条规则
+	if [ -z "$ports" ] || [ "$ports" = "1:65535" ]; then
+		local full_rule="$rule_prefix $rule_suffix"
+		# 清理多余空格
+		full_rule=$(echo "$full_rule" | tr -s ' ')
+		insert_rule_before "$ipt_cmd" "$chain" "$target_rule" "$full_rule"
+		return 0
+	fi
+	
+	# 将端口列表按逗号分割，分别处理单端口和范围端口
+	local port_list=$(echo "$ports" | tr ',' ' ')
+	local multiport_group=""  # multiport组（单端口）
+	local multiport_count=0
+	
+	for port_item in $port_list; do
+		# 检查是否为范围端口（包含冒号）
+		if echo "$port_item" | grep -q ':'; then
+			# 范围端口，需要单独创建规则
+			local port_rule="--dport $port_item"
+			local full_rule="$rule_prefix $port_rule $rule_suffix"
+			full_rule=$(echo "$full_rule" | tr -s ' ')
+			insert_rule_before "$ipt_cmd" "$chain" "$target_rule" "$full_rule"
+		else
+			# 单端口，加入multiport组
+			if [ $multiport_count -eq 0 ]; then
+				multiport_group="$port_item"
+			else
+				multiport_group="$multiport_group,$port_item"
+			fi
+			multiport_count=$((multiport_count + 1))
+			
+			# 每15个端口时创建一条multiport规则
+			if [ $multiport_count -eq 15 ]; then
+				local port_rule="-m multiport --dports $multiport_group"
+				local full_rule="$rule_prefix $port_rule $rule_suffix"
+				full_rule=$(echo "$full_rule" | tr -s ' ')
+				insert_rule_before "$ipt_cmd" "$chain" "$target_rule" "$full_rule"
+				multiport_group=""
+				multiport_count=0
+			fi
+		fi
+	done
+	
+	# 处理剩余的multiport组（不足15个的情况）
+	if [ $multiport_count -gt 0 ]; then
+		local port_rule="-m multiport --dports $multiport_group"
+		local full_rule="$rule_prefix $port_rule $rule_suffix"
+		full_rule=$(echo "$full_rule" | tr -s ' ')
+		insert_rule_before "$ipt_cmd" "$chain" "$target_rule" "$full_rule"
+	fi
+}
+
+# TCP流量处理函数，增加Direct-IF支持
+tcp_proxy() {
+	local node=$1
+	local target=$2
+	local port=$3
+	
+	# 类型分发：检查节点类型并调用相应函数
+	case "$(config_n_get $node type)" in
+		"Direct-IF")
+			# 加载Direct-IF模块并调用专用函数
+			. $APP_PATH/direct_if.sh
+			direct_if_tcp_mark "$node" "$target" "$port"
+			return $?
+			;;
+		*)
+			# 原有的TCP流量处理逻辑
+			$ipt_n -A PSW_RULE $(comment "PSW-TCP") -p tcp $target -j REDIRECT --to-ports $port
+			;;
+	esac
+}
+
+# UDP流量处理函数，增加Direct-IF支持
+udp_proxy() {
+	local node=$1
+	local target=$2
+	local port=$3
+	
+	# 类型分发：检查节点类型并调用相应函数
+	case "$(config_n_get $node type)" in
+		"Direct-IF")
+			# 加载Direct-IF模块并调用专用函数
+			. $APP_PATH/direct_if.sh
+			direct_if_udp_mark "$node" "$target" "$port"
+			return $?
+			;;
+		*)
+			# 原有的UDP流量处理逻辑
+			$ipt_m -A PSW_RULE $(comment "PSW-UDP") -p udp $target -j TPROXY --on-port $port --tproxy-mark 0x1/0x1
+			;;
+	esac
+}
+
 dst() {
 	echo "-m set $2 --match-set $1 dst"
 }
@@ -453,7 +556,9 @@ load_acl() {
 				[ -n "$tcp_port" ] && {
 					if [ -n "${tcp_proxy_mode}" ]; then
 						msg2="${msg}使用 TCP 节点[$tcp_node_remark]"
-						if [ -n "${is_tproxy}" ]; then
+						# Direct-IF节点强制使用TPROXY模式（通过PSW_RULE链）
+						local is_direct_if=$(get_cache_var "node_${tcp_node}_tcp_direct_if")
+						if [ -n "${is_tproxy}" ] || [ "$is_direct_if" = "1" ]; then
 							msg2="${msg2}(TPROXY:${tcp_port})"
 							ipt_tmp=$ipt_m
 							ipt_j="-j PSW_RULE"
@@ -486,7 +591,8 @@ load_acl() {
 						[ "${chn_list}" != "0" ] && add_port_rules "$ipt_tmp -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "$(dst $IPSET_CHN) $(get_jump_ipt ${chn_list} "${ipt_j}")"
 						[ "${use_shunt_tcp}" = "1" ] && add_port_rules "$ipt_tmp -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "$(dst $shunt_set_name) ${ipt_j}"
 						[ "${tcp_proxy_mode}" != "disable" ] && add_port_rules "$ipt_tmp -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "${ipt_j}"
-						[ -n "${is_tproxy}" ] && $ipt_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source} $(REDIRECT $tcp_port TPROXY)
+						# Direct-IF节点不需要最终的TPROXY规则，流量会通过标记进行策略路由
+						[ -n "${is_tproxy}" ] && [ "$is_direct_if" != "1" ] && $ipt_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source} $(REDIRECT $tcp_port TPROXY)
 
 						[ "$PROXY_IPV6" == "1" ] && {
 							$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source} -d $FAKE_IP_6 -j PSW_RULE 2>/dev/null
@@ -495,7 +601,8 @@ load_acl() {
 							[ "${chn_list}" != "0" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "$(dst $IPSET_CHN6) $(get_jump_ipt ${chn_list} "-j PSW_RULE")" 2>/dev/null
 							[ "${use_shunt_tcp}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "$(dst $shunt6_set_name) -j PSW_RULE" 2>/dev/null
 							[ "${tcp_proxy_mode}" != "disable" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "-j PSW_RULE" 2>/dev/null
-							$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source} $(REDIRECT $tcp_port TPROXY) 2>/dev/null
+							# Direct-IF节点不需要最终的TPROXY规则
+							[ "$is_direct_if" != "1" ] && $ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source} $(REDIRECT $tcp_port TPROXY) 2>/dev/null
 						}
 					else
 						msg2="${msg}不代理 TCP"
@@ -509,7 +616,13 @@ load_acl() {
 				[ -n "$udp_port" ] && {
 					if [ -n "${udp_proxy_mode}" ]; then
 						msg2="${msg}使用 UDP 节点[$udp_node_remark]"
-						msg2="${msg2}(TPROXY:${udp_port})"
+						# Direct-IF节点特殊处理
+						local is_direct_if_udp=$(get_cache_var "node_${udp_node}_udp_direct_if")
+						if [ "$is_direct_if_udp" = "1" ]; then
+							msg2="${msg2}(Direct-IF)"
+						else
+							msg2="${msg2}(TPROXY:${udp_port})"
+						fi
 
 						$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source} -d $FAKE_IP -j PSW_RULE
 						[ "${use_proxy_list}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "$(dst $black_set_name) -j PSW_RULE"
@@ -517,7 +630,8 @@ load_acl() {
 						[ "${chn_list}" != "0" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "$(dst $IPSET_CHN) $(get_jump_ipt ${chn_list} "-j PSW_RULE")"
 						[ "${use_shunt_udp}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "$(dst $shunt_set_name) -j PSW_RULE"
 						[ "${udp_proxy_mode}" != "disable" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "-j PSW_RULE"
-						$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source} $(REDIRECT $udp_port TPROXY)
+						# Direct-IF节点不需要最终的TPROXY规则
+						[ "$is_direct_if_udp" != "1" ] && $ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source} $(REDIRECT $udp_port TPROXY)
 
 						[ "$PROXY_IPV6" == "1" ] && {
 							$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source} -d $FAKE_IP_6 -j PSW_RULE 2>/dev/null
@@ -526,7 +640,8 @@ load_acl() {
 							[ "${chn_list}" != "0" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "$(dst $IPSET_CHN6) $(get_jump_ipt ${chn_list} "-j PSW_RULE")" 2>/dev/null
 							[ "${use_shunt_udp}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "$(dst $shunt6_set_name) -j PSW_RULE" 2>/dev/null
 							[ "${udp_proxy_mode}" != "disable" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "-j PSW_RULE" 2>/dev/null
-							$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source} $(REDIRECT $udp_port TPROXY) 2>/dev/null
+							# Direct-IF节点不需要最终的TPROXY规则
+							[ "$is_direct_if_udp" != "1" ] && $ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source} $(REDIRECT $udp_port TPROXY) 2>/dev/null
 						}
 					else
 						msg2="${msg}不代理 UDP"
@@ -637,7 +752,9 @@ load_acl() {
 		if [ -n "${TCP_PROXY_MODE}" ]; then
 			[ -n "$TCP_NODE" ] && {
 				msg2="${msg}使用 TCP 节点[$(config_n_get $TCP_NODE remarks)]"
-				if [ -n "${is_tproxy}" ]; then
+				# Direct-IF节点强制使用TPROXY模式（通过PSW_RULE链）
+				local is_direct_if=$(get_cache_var "node_${TCP_NODE}_tcp_direct_if")
+				if [ -n "${is_tproxy}" ] || [ "$is_direct_if" = "1" ]; then
 					msg2="${msg2}(TPROXY:${TCP_REDIR_PORT})"
 					ipt_j="-j PSW_RULE"
 				else
@@ -669,7 +786,8 @@ load_acl() {
 				[ "${CHN_LIST}" != "0" ] && add_port_rules "$ipt_tmp -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_CHN) $(get_jump_ipt ${CHN_LIST} "${ipt_j}")"
 				[ "${USE_SHUNT_TCP}" = "1" ] && add_port_rules "$ipt_tmp -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_SHUNT) ${ipt_j}"
 				[ "${TCP_PROXY_MODE}" != "disable" ] && add_port_rules "$ipt_tmp -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "${ipt_j}"
-				[ -n "${is_tproxy}" ]&& $ipt_tmp -A PSW $(comment "默认") -p tcp $(REDIRECT $TCP_REDIR_PORT TPROXY)
+				# Direct-IF节点不需要最终的TPROXY规则
+				[ -n "${is_tproxy}" ] && [ "$is_direct_if" != "1" ] && $ipt_tmp -A PSW $(comment "默认") -p tcp $(REDIRECT $TCP_REDIR_PORT TPROXY)
 
 				[ "$PROXY_IPV6" == "1" ] && {
 					$ip6t_m -A PSW $(comment "默认") -p tcp -d $FAKE_IP_6 -j PSW_RULE
@@ -678,7 +796,8 @@ load_acl() {
 					[ "${CHN_LIST}" != "0" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_CHN6) $(get_jump_ipt ${CHN_LIST} "-j PSW_RULE")"
 					[ "${USE_SHUNT_TCP}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_SHUNT6) -j PSW_RULE"
 					[ "${TCP_PROXY_MODE}" != "disable" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "-j PSW_RULE"
-					$ip6t_m -A PSW $(comment "默认") -p tcp $(REDIRECT $TCP_REDIR_PORT TPROXY)
+					# Direct-IF节点不需要最终的TPROXY规则
+					[ "$is_direct_if" != "1" ] && $ip6t_m -A PSW $(comment "默认") -p tcp $(REDIRECT $TCP_REDIR_PORT TPROXY)
 				}
 
 				echolog "     - ${msg2}"
@@ -691,7 +810,13 @@ load_acl() {
 		#  加载UDP默认代理模式
 		if [ -n "${UDP_PROXY_MODE}" ]; then
 			[ -n "$UDP_NODE" -o "$TCP_UDP" = "1" ] && {
-				msg2="${msg}使用 UDP 节点[$(config_n_get $UDP_NODE remarks)](TPROXY:${UDP_REDIR_PORT})"
+				# Direct-IF节点特殊处理
+				local is_direct_if_udp=$(get_cache_var "node_${UDP_NODE}_udp_direct_if")
+				if [ "$is_direct_if_udp" = "1" ]; then
+					msg2="${msg}使用 UDP 节点[$(config_n_get $UDP_NODE remarks)](Direct-IF)"
+				else
+					msg2="${msg}使用 UDP 节点[$(config_n_get $UDP_NODE remarks)](TPROXY:${UDP_REDIR_PORT})"
+				fi
 
 				$ipt_m -A PSW $(comment "默认") -p udp -d $FAKE_IP -j PSW_RULE
 				[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_BLACK) -j PSW_RULE"
@@ -699,7 +824,8 @@ load_acl() {
 				[ "${CHN_LIST}" != "0" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_CHN) $(get_jump_ipt ${CHN_LIST} "-j PSW_RULE")"
 				[ "${USE_SHUNT_UDP}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_SHUNT) -j PSW_RULE"
 				[ "${UDP_PROXY_MODE}" != "disable" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "-j PSW_RULE"
-				$ipt_m -A PSW $(comment "默认") -p udp $(REDIRECT $UDP_REDIR_PORT TPROXY)
+				# Direct-IF节点不需要最终的TPROXY规则
+				[ "$is_direct_if_udp" != "1" ] && $ipt_m -A PSW $(comment "默认") -p udp $(REDIRECT $UDP_REDIR_PORT TPROXY)
 
 				[ "$PROXY_IPV6" == "1" ] && {
 					$ip6t_m -A PSW $(comment "默认") -p udp -d $FAKE_IP_6 -j PSW_RULE
@@ -708,7 +834,8 @@ load_acl() {
 					[ "${CHN_LIST}" != "0" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_CHN6) $(get_jump_ipt ${CHN_LIST} "-j PSW_RULE")"
 					[ "${USE_SHUNT_UDP}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_SHUNT6) -j PSW_RULE"
 					[ "${UDP_PROXY_MODE}" != "disable" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "-j PSW_RULE"
-					$ip6t_m -A PSW $(comment "默认") -p udp $(REDIRECT $UDP_REDIR_PORT TPROXY)
+					# Direct-IF节点不需要最终的TPROXY规则
+					[ "$is_direct_if_udp" != "1" ] && $ip6t_m -A PSW $(comment "默认") -p udp $(REDIRECT $UDP_REDIR_PORT TPROXY)
 				}
 
 				echolog "     - ${msg2}"
@@ -985,6 +1112,55 @@ add_firewall_rule() {
 	$ipt_m -N PSW_RULE
 	$ipt_m -A PSW_RULE -j CONNMARK --restore-mark
 	$ipt_m -A PSW_RULE -m mark --mark 1 -j RETURN
+	
+	# 添加Direct-IF节点的标记规则（在CONNMARK --save-mark之前）
+	add_direct_if_rules() {
+		local protocol="$1"
+		# 删除未使用的node_type参数
+		
+		# 检查全局节点
+		if [ -n "$TCP_NODE" ] && [ "$protocol" = "tcp" ] && [ "$(config_n_get $TCP_NODE type)" = "Direct-IF" ]; then
+			tcp_proxy "$TCP_NODE" "" "$TCP_REDIR_PORT"
+		fi
+		if [ -n "$UDP_NODE" ] && [ "$protocol" = "udp" ] && [ "$(config_n_get $UDP_NODE type)" = "Direct-IF" ]; then
+			udp_proxy "$UDP_NODE" "" "$UDP_REDIR_PORT"
+		fi
+		
+		# 检查ACL节点（通过环境变量传递protocol）
+		export DIRECT_IF_PROTOCOL="$protocol"
+		config_foreach check_acl_direct_if acl_rule
+		unset DIRECT_IF_PROTOCOL
+	}
+	
+	# 检查ACL规则中的Direct-IF节点
+	check_acl_direct_if() {
+		local sid="$1"
+		local protocol="$DIRECT_IF_PROTOCOL"  # 从环境变量获取protocol
+		local enabled tcp_node udp_node
+		
+		config_get enabled "$sid" "enabled" "0"
+		[ "$enabled" = "0" ] && return 0
+		
+		config_get tcp_node "$sid" "tcp_node"
+		config_get udp_node "$sid" "udp_node"
+		
+		if [ -n "$tcp_node" ] && [ "$tcp_node" != "nil" ] && [ "$tcp_node" != "default" ] && [ "$tcp_node" != "tcp" ]; then
+			if [ "$(config_n_get $tcp_node type)" = "Direct-IF" ] && [ "$protocol" = "tcp" ]; then
+				tcp_proxy "$tcp_node" "" ""
+			fi
+		fi
+		
+		if [ -n "$udp_node" ] && [ "$udp_node" != "nil" ] && [ "$udp_node" != "default" ] && [ "$udp_node" != "tcp" ]; then
+			if [ "$(config_n_get $udp_node type)" = "Direct-IF" ] && [ "$protocol" = "udp" ]; then
+				udp_proxy "$udp_node" "" ""
+			fi
+		fi
+	}
+	
+	# 添加全局Direct-IF规则
+	add_direct_if_rules "tcp"
+	add_direct_if_rules "udp"
+	
 	$ipt_m -A PSW_RULE -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -j MARK --set-xmark 1
 	$ipt_m -A PSW_RULE -p udp -m conntrack --ctstate NEW -j MARK --set-xmark 1
 	$ipt_m -A PSW_RULE -j CONNMARK --save-mark
@@ -1058,6 +1234,10 @@ add_firewall_rule() {
 	$ip6t_m -N PSW_RULE
 	$ip6t_m -A PSW_RULE -j CONNMARK --restore-mark
 	$ip6t_m -A PSW_RULE -m mark --mark 1 -j RETURN
+	
+	# 添加Direct-IF节点的IPv6标记规则（在CONNMARK --save-mark之前）
+	# IPv6规则在tcp_proxy和udp_proxy函数中已经处理了
+	
 	$ip6t_m -A PSW_RULE -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -j MARK --set-xmark 1
 	$ip6t_m -A PSW_RULE -p udp -m conntrack --ctstate NEW -j MARK --set-xmark 1
 	$ip6t_m -A PSW_RULE -j CONNMARK --save-mark

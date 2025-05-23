@@ -383,6 +383,9 @@ get_cache_var() {
 	}
 }
 
+# 加载Direct-IF模块
+. $APP_PATH/direct_if.sh
+
 eval_cache_var() {
 	[ -s "$TMP_PATH/var" ] && eval $(cat "$TMP_PATH/var")
 }
@@ -770,6 +773,16 @@ run_redir() {
 	local enable_log=$(config_t_get global log_${proto} 1)
 	[ "$enable_log" != "1" ] && log_file="/dev/null"
 	local remarks=$(config_n_get $node remarks)
+	
+	# Direct-IF节点特殊处理：不需要启动任何代理进程
+	if [ "$type" = "direct-if" ]; then
+		echolog "${PROTO}节点：[$remarks]，使用 Direct-IF 策略路由"
+		# 设置必要的缓存变量以供防火墙规则使用
+		set_cache_var "node_${node}_${proto}_direct_if" "1"
+		set_cache_var "node_${node}_${proto}_redir_port" "$local_port"
+		return 0
+	fi
+	
 	local server_host=$(config_n_get $node address)
 	local port=$(config_n_get $node port)
 	[ -n "$server_host" ] && [ -n "$port" ] && {
@@ -2109,6 +2122,25 @@ start() {
 		}
 	fi
 
+	# 先处理Direct-IF节点类型 - 因为不需要启动任何进程
+	[ "$ENABLED_DEFAULT_ACL" == 1 ] && {
+		for node in $TCP_NODE $UDP_NODE; do
+			[ "$node" = "nil" ] && continue
+			if [ "$(config_n_get $node type)" = "Direct-IF" ]; then
+				if ! setup_direct_if $node; then
+					echolog error "Direct-IF节点 [$(config_n_get $node remarks)] 设置失败，请检查配置"
+					# 存储错误状态供UI显示
+					set_cache_var "direct_if_${node}_error" "1"
+				fi
+			fi
+		done
+	}
+	
+	# 还需要处理ACL中的Direct-IF节点
+	if [ "$ENABLED_ACLS" == 1 ]; then
+		config_foreach setup_acl_direct_if_nodes acl_rule
+	fi
+
 	[ "$ENABLED_DEFAULT_ACL" == 1 ] && {
 		mkdir -p ${GLOBAL_ACL_PATH}
 		start_redir TCP
@@ -2135,6 +2167,10 @@ start() {
 stop() {
 	clean_log
 	eval_cache_var
+	
+	# 清理Direct-IF设置的策略路由规则（使用模块化函数）
+	cleanup_all_direct_if
+	
 	[ -n "$USE_TABLES" ] && source $APP_PATH/${USE_TABLES}.sh stop
 	delete_ip2route
 	kill_all v2ray-plugin obfs-local

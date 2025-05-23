@@ -507,7 +507,12 @@ function get_valid_nodes()
 				e["node_type"] = "special"
 				nodes[#nodes + 1] = e
 			end
-			if e.port and e.address then
+			-- Direct-IF 节点特殊处理
+			if e.type == "Direct-IF" and e.interface_name then
+				e["remark"] = "%s：[%s] %s" % {i18n.translatef("Direct Interface"), e.remarks, e.interface_name}
+				e["node_type"] = "normal"
+				nodes[#nodes + 1] = e
+			elseif e.port and e.address then
 				local address = e.address
 				if is_ip(address) or datatypes.hostname(address) then
 					local type = e.type
@@ -555,6 +560,11 @@ function get_node_remarks(n)
 		if (n.type == "sing-box" or n.type == "Xray") and n.protocol and
 		   (n.protocol == "_balancing" or n.protocol == "_shunt" or n.protocol == "_iface" or n.protocol == "_urltest") then
 			remarks = "%s：[%s] " % {n.type .. " " .. i18n.translatef(n.protocol), n.remarks}
+		elseif n.type == "Direct-IF" then
+			remarks = "%s：[%s]" % {i18n.translatef("Direct Interface"), n.remarks}
+			if n.interface_name then
+				remarks = remarks .. " " .. n.interface_name
+			end
 		else
 			local type2 = n.type
 			if (n.type == "sing-box" or n.type == "Xray") and n.protocol then

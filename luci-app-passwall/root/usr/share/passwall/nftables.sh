@@ -58,6 +58,70 @@ factor() {
 	fi
 }
 
+# 辅助函数：获取IPv4连接跟踪mark保存规则的句柄（带ANSI颜色码净化和fallback）
+get_connmark_save_handle() {
+	# 查找"ct mark set mark"规则的句柄，并去除ANSI颜色码
+	local handle=$(nft -a list chain $NFTABLE_NAME PSW_RULE 2>/dev/null | grep "ct mark set mark" | \
+		sed -r 's/\x1b\[[0-9;]*m//g' | \
+		sed -r 's/.*#([0-9]+)$/\1/' | head -n1 2>/dev/null || true)
+	
+	# Debug: 如果无法获取handle，记录debug信息（仅在debug模式下）
+	if [ -z "$handle" ] && [ "${LOG_LEVEL:-info}" = "debug" ]; then
+		# 记录debug信息到日志，但不影响正常流程
+		{
+			echo "$(date "+%Y-%m-%d %H:%M:%S"): Direct-IF Debug: nftables handle解析失败"
+			echo "  - 表名: $NFTABLE_NAME, 链名: PSW_RULE"
+			echo "  - nft输出片段:"
+			nft -a list chain $NFTABLE_NAME PSW_RULE 2>/dev/null | head -5 | sed 's/^/    /'
+		} >> ${LOG_FILE:-/tmp/log/passwall.log} 2>/dev/null || true
+	fi
+	
+	# 如果无法获取handle，返回空值（调用方会使用fallback方法）
+	echo "$handle"
+}
+
+# TCP流量处理函数，增加Direct-IF支持
+tcp_proxy() {
+	local node=$1
+	local target=$2
+	local port=$3
+	
+	# 类型分发：检查节点类型并调用相应函数
+	case "$(config_n_get $node type)" in
+		"Direct-IF")
+			# 加载Direct-IF模块并调用专用函数
+			. $APP_PATH/direct_if.sh
+			direct_if_nft_tcp_mark "$node" "$target" "$port"
+			return $?
+			;;
+		*)
+			# 原有的TCP流量处理逻辑 - nftables在其他地方处理
+			return 0
+			;;
+	esac
+}
+
+# UDP流量处理函数，增加Direct-IF支持
+udp_proxy() {
+	local node=$1
+	local target=$2
+	local port=$3
+	
+	# 类型分发：检查节点类型并调用相应函数
+	case "$(config_n_get $node type)" in
+		"Direct-IF")
+			# 加载Direct-IF模块并调用专用函数
+			. $APP_PATH/direct_if.sh
+			direct_if_nft_udp_mark "$node" "$target" "$port"
+			return $?
+			;;
+		*)
+			# 原有的UDP流量处理逻辑 - nftables在其他地方处理
+			return 0
+			;;
+	esac
+}
+
 insert_rule_before() {
 	[ $# -ge 4 ] || {
 		return 1
@@ -470,7 +534,9 @@ load_acl() {
 				[ -n "$tcp_port" ] && {
 					if [ -n "${tcp_proxy_mode}" ]; then
 						msg2="${msg}使用 TCP 节点[$tcp_node_remark]"
-						if [ -n "${is_tproxy}" ]; then
+						# Direct-IF节点强制使用TPROXY模式（通过PSW_RULE链）
+						local is_direct_if=$(get_cache_var "node_${tcp_node}_tcp_direct_if")
+						if [ -n "${is_tproxy}" ] || [ "$is_direct_if" = "1" ]; then
 							msg2="${msg2}(TPROXY:${tcp_port})"
 							nft_chain="PSW_MANGLE"
 							nft_j="counter jump PSW_RULE"
@@ -508,7 +574,8 @@ load_acl() {
 						[ "${chn_list}" != "0" ] && nft "add rule $NFTABLE_NAME $nft_chain ip protocol tcp ${_ipt_source} $(factor $tcp_redir_ports "tcp dport") ip daddr @$NFTSET_CHN $(get_jump_ipt ${chn_list} "${nft_j}") comment \"$remarks\" "
 						[ "${use_shunt_tcp}" = "1" ] && nft "add rule $NFTABLE_NAME $nft_chain ip protocol tcp ${_ipt_source} $(factor $tcp_redir_ports "tcp dport") ip daddr @$shunt_set_name ${nft_j} comment \"$remarks\""
 						[ "${tcp_proxy_mode}" != "disable" ] && nft "add rule $NFTABLE_NAME $nft_chain ip protocol tcp ${_ipt_source} $(factor $tcp_redir_ports "tcp dport") ${nft_j} comment \"$remarks\""
-						[ -n "${is_tproxy}" ] && nft "add rule $NFTABLE_NAME $nft_chain ip protocol tcp ${_ipt_source} $(REDIRECT $tcp_port TPROXY4) comment \"$remarks\""
+						# Direct-IF节点不需要最终的TPROXY规则，流量会通过标记进行策略路由
+						[ -n "${is_tproxy}" ] && [ "$is_direct_if" != "1" ] && nft "add rule $NFTABLE_NAME $nft_chain ip protocol tcp ${_ipt_source} $(REDIRECT $tcp_port TPROXY4) comment \"$remarks\""
 
 						[ "$PROXY_IPV6" == "1" ] && {
 							nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto tcp ${_ipt_source} ip6 daddr $FAKE_IP_6 counter jump PSW_RULE comment \"$remarks\""
@@ -517,7 +584,8 @@ load_acl() {
 							[ "${chn_list}" != "0" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto tcp ${_ipt_source} $(factor $tcp_redir_ports "tcp dport") ip6 daddr @$NFTSET_CHN6 $(get_jump_ipt ${chn_list} "counter jump PSW_RULE") comment \"$remarks\" "
 							[ "${use_shunt_tcp}" = "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto tcp ${_ipt_source} $(factor $tcp_redir_ports "tcp dport") ip6 daddr @$shunt6_set_name counter jump PSW_RULE comment \"$remarks\"" 2>/dev/null
 							[ "${tcp_proxy_mode}" != "disable" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto tcp ${_ipt_source} $(factor $tcp_redir_ports "tcp dport") counter jump PSW_RULE comment \"$remarks\"" 2>/dev/null
-							nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto tcp ${_ipt_source} $(REDIRECT $tcp_port TPROXY) comment \"$remarks\"" 2>/dev/null
+							# Direct-IF节点不需要最终的TPROXY规则
+							[ "$is_direct_if" != "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto tcp ${_ipt_source} $(REDIRECT $tcp_port TPROXY) comment \"$remarks\"" 2>/dev/null
 						}
 					else
 						msg2="${msg}不代理 TCP"
@@ -531,7 +599,13 @@ load_acl() {
 				[ -n "$udp_port" ] && {
 					if [ -n "${udp_proxy_mode}" ]; then
 						msg2="${msg}使用 UDP 节点[$udp_node_remark]"
-						msg2="${msg2}(TPROXY:${udp_port})"
+						# Direct-IF节点特殊处理
+						local is_direct_if_udp=$(get_cache_var "node_${udp_node}_udp_direct_if")
+						if [ "$is_direct_if_udp" = "1" ]; then
+							msg2="${msg2}(Direct-IF)"
+						else
+							msg2="${msg2}(TPROXY:${udp_port})"
+						fi
 
 						nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp ${_ipt_source} ip daddr $FAKE_IP counter jump PSW_RULE comment \"$remarks\""
 						[ "${use_proxy_list}" = "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp ${_ipt_source} $(factor $udp_redir_ports "udp dport") ip daddr @$black_set_name counter jump PSW_RULE comment \"$remarks\""
@@ -539,7 +613,8 @@ load_acl() {
 						[ "${chn_list}" != "0" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp ${_ipt_source} $(factor $udp_redir_ports "udp dport") ip daddr @$NFTSET_CHN $(get_jump_ipt ${chn_list} "counter jump PSW_RULE") comment \"$remarks\""
 						[ "${use_shunt_udp}" = "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp ${_ipt_source} $(factor $udp_redir_ports "udp dport") ip daddr @$shunt_set_name counter jump PSW_RULE comment \"$remarks\""
 						[ "${udp_proxy_mode}" != "disable" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp ${_ipt_source} $(factor $udp_redir_ports "udp dport") counter jump PSW_RULE comment \"$remarks\""
-						nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp ${_ipt_source} $(REDIRECT $udp_port TPROXY4) comment \"$remarks\""
+						# Direct-IF节点不需要最终的TPROXY规则
+						[ "$is_direct_if_udp" != "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp ${_ipt_source} $(REDIRECT $udp_port TPROXY4) comment \"$remarks\""
 
 						[ "$PROXY_IPV6" == "1" ] && {
 							nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto udp ${_ipt_source} ip6 daddr $FAKE_IP_6 counter jump PSW_RULE comment \"$remarks\""
@@ -548,7 +623,8 @@ load_acl() {
 							[ "${chn_list}" != "0" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto udp ${_ipt_source} $(factor $udp_redir_ports "udp dport") ip6 daddr @$NFTSET_CHN6 $(get_jump_ipt ${chn_list} "counter jump PSW_RULE") comment \"$remarks\"" 2>/dev/null
 							[ "${use_shunt_udp}" = "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto udp ${_ipt_source} $(factor $udp_redir_ports "udp dport") ip6 daddr @$shunt6_set_name counter jump PSW_RULE comment \"$remarks\"" 2>/dev/null
 							[ "${udp_proxy_mode}" != "disable" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto udp ${_ipt_source} $(factor $udp_redir_ports "udp dport") counter jump PSW_RULE comment \"$remarks\"" 2>/dev/null
-							nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto udp ${_ipt_source} $(REDIRECT $udp_port TPROXY) comment \"$remarks\"" 2>/dev/null
+							# Direct-IF节点不需要最终的TPROXY规则
+							[ "$is_direct_if_udp" != "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto udp ${_ipt_source} $(REDIRECT $udp_port TPROXY) comment \"$remarks\"" 2>/dev/null
 						}
 					else
 						msg2="${msg}不代理 UDP"
@@ -659,7 +735,9 @@ load_acl() {
 		if [ -n "${TCP_PROXY_MODE}" ]; then
 			[ -n "$TCP_NODE" ] && {
 				msg2="${msg}使用 TCP 节点[$(config_n_get $TCP_NODE remarks)]"
-				if [ -n "${is_tproxy}" ]; then
+				# Direct-IF节点强制使用TPROXY模式（通过PSW_RULE链）
+				local is_direct_if=$(get_cache_var "node_${TCP_NODE}_tcp_direct_if")
+				if [ -n "${is_tproxy}" ] || [ "$is_direct_if" = "1" ]; then
 					msg2="${msg2}(TPROXY:${TCP_REDIR_PORT})"
 					nft_chain="PSW_MANGLE"
 					nft_j="counter jump PSW_RULE"
@@ -697,7 +775,8 @@ load_acl() {
 				[ "${CHN_LIST}" != "0" ] && nft "add rule $NFTABLE_NAME $nft_chain ip protocol tcp $(factor $TCP_REDIR_PORTS "tcp dport") ip daddr @$NFTSET_CHN $(get_jump_ipt ${CHN_LIST} "${nft_j}") comment \"默认\""
 				[ "${USE_SHUNT_TCP}" = "1" ] && nft "add rule $NFTABLE_NAME $nft_chain ip protocol tcp $(factor $TCP_REDIR_PORTS "tcp dport") ip daddr @$NFTSET_SHUNT ${nft_j} comment \"默认\""
 				[ "${TCP_PROXY_MODE}" != "disable" ] && nft "add rule $NFTABLE_NAME $nft_chain ip protocol tcp $(factor $TCP_REDIR_PORTS "tcp dport") ${nft_j} comment \"默认\""
-				[ -n "${is_tproxy}" ] && nft "add rule $NFTABLE_NAME $nft_chain ip protocol tcp $(REDIRECT $TCP_REDIR_PORT TPROXY4) comment \"默认\""
+				# Direct-IF节点不需要最终的TPROXY规则
+				[ -n "${is_tproxy}" ] && [ "$is_direct_if" != "1" ] && nft "add rule $NFTABLE_NAME $nft_chain ip protocol tcp $(REDIRECT $TCP_REDIR_PORT TPROXY4) comment \"默认\""
 				nft "add rule $NFTABLE_NAME $nft_chain ip protocol tcp counter return comment \"默认\""
 
 				[ "$PROXY_IPV6" == "1" ] && {
@@ -707,7 +786,8 @@ load_acl() {
 					[ "${CHN_LIST}" != "0" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto tcp $(factor $TCP_REDIR_PORTS "tcp dport") ip6 daddr @$NFTSET_CHN6 $(get_jump_ipt ${CHN_LIST} "counter jump PSW_RULE") comment \"默认\""
 					[ "${USE_SHUNT_TCP}" = "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto tcp $(factor $TCP_REDIR_PORTS "tcp dport") ip6 daddr @$NFTSET_SHUNT6 counter jump PSW_RULE comment \"默认\""
 					[ "${TCP_PROXY_MODE}" != "disable" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto tcp $(factor $TCP_REDIR_PORTS "tcp dport") counter jump PSW_RULE comment \"默认\""
-					nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto tcp $(REDIRECT $TCP_REDIR_PORT TPROXY) comment \"默认\""
+					# Direct-IF节点不需要最终的TPROXY规则
+					[ "$is_direct_if" != "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto tcp $(REDIRECT $TCP_REDIR_PORT TPROXY) comment \"默认\""
 					nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto tcp counter return comment \"默认\""
 				}
 
@@ -718,7 +798,13 @@ load_acl() {
 		#  加载UDP默认代理模式
 		if [ -n "${UDP_PROXY_MODE}" ]; then
 			[ -n "$UDP_NODE" -o "$TCP_UDP" = "1" ] && {
-				msg2="${msg}使用 UDP 节点[$(config_n_get $UDP_NODE remarks)](TPROXY:${UDP_REDIR_PORT})"
+				# Direct-IF节点特殊处理
+				local is_direct_if_udp=$(get_cache_var "node_${UDP_NODE}_udp_direct_if")
+				if [ "$is_direct_if_udp" = "1" ]; then
+					msg2="${msg}使用 UDP 节点[$(config_n_get $UDP_NODE remarks)](Direct-IF)"
+				else
+					msg2="${msg}使用 UDP 节点[$(config_n_get $UDP_NODE remarks)](TPROXY:${UDP_REDIR_PORT})"
+				fi
 
 				nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp ip daddr $FAKE_IP counter jump PSW_RULE comment \"默认\""
 				[ "${USE_PROXY_LIST}" = "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp $(factor $UDP_REDIR_PORTS "udp dport") ip daddr @$NFTSET_BLACK counter jump PSW_RULE comment \"默认\""
@@ -726,7 +812,8 @@ load_acl() {
 				[ "${CHN_LIST}" != "0" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp $(factor $UDP_REDIR_PORTS "udp dport") ip daddr @$NFTSET_CHN $(get_jump_ipt ${CHN_LIST} "counter jump PSW_RULE") comment \"默认\""
 				[ "${USE_SHUNT_UDP}" = "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp $(factor $UDP_REDIR_PORTS "udp dport") ip daddr @$NFTSET_SHUNT counter jump PSW_RULE comment \"默认\""
 				[ "${UDP_PROXY_MODE}" != "disable" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp $(factor $UDP_REDIR_PORTS "udp dport") counter jump PSW_RULE comment \"默认\""
-				nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp $(REDIRECT $UDP_REDIR_PORT TPROXY4) comment \"默认\""
+				# Direct-IF节点不需要最终的TPROXY规则
+				[ "$is_direct_if_udp" != "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp $(REDIRECT $UDP_REDIR_PORT TPROXY4) comment \"默认\""
 				nft "add rule $NFTABLE_NAME PSW_MANGLE ip protocol udp counter return comment \"默认\""
 
 				[ "$PROXY_IPV6" == "1" ] && {
@@ -736,7 +823,8 @@ load_acl() {
 					[ "${CHN_LIST}" != "0" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto udp $(factor $UDP_REDIR_PORTS "udp dport") ip6 daddr @$NFTSET_CHN6 $(get_jump_ipt ${CHN_LIST} "counter jump PSW_RULE") comment \"默认\""
 					[ "${USE_SHUNT_UDP}" = "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto udp $(factor $UDP_REDIR_PORTS "udp dport") ip6 daddr @$NFTSET_SHUNT6 counter jump PSW_RULE comment \"默认\""
 					[ "${UDP_PROXY_MODE}" != "disable" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto udp $(factor $UDP_REDIR_PORTS "udp dport") counter jump PSW_RULE comment \"默认\""
-					nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto udp $(REDIRECT $UDP_REDIR_PORT TPROXY) comment \"默认\""
+					# Direct-IF节点不需要最终的TPROXY规则
+					[ "$is_direct_if_udp" != "1" ] && nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto udp $(REDIRECT $UDP_REDIR_PORT TPROXY) comment \"默认\""
 					nft "add rule $NFTABLE_NAME PSW_MANGLE_V6 meta l4proto udp counter return comment \"默认\""
 				}
 
@@ -1003,6 +1091,51 @@ add_firewall_rule() {
 	nft "flush chain $NFTABLE_NAME PSW_RULE"
 	nft "add rule $NFTABLE_NAME PSW_RULE meta mark set ct mark counter"
 	nft "add rule $NFTABLE_NAME PSW_RULE meta mark 1 counter return"
+	
+	# 添加Direct-IF节点的标记规则（在ct mark set mark之前）
+	add_direct_if_nft_rules() {
+		local protocol="$1"
+		
+		# 检查全局节点
+		if [ -n "$TCP_NODE" ] && [ "$protocol" = "tcp" ] && [ "$(config_n_get $TCP_NODE type)" = "Direct-IF" ]; then
+			tcp_proxy "$TCP_NODE" "" ""
+		fi
+		if [ -n "$UDP_NODE" ] && [ "$protocol" = "udp" ] && [ "$(config_n_get $UDP_NODE type)" = "Direct-IF" ]; then
+			udp_proxy "$UDP_NODE" "" ""
+		fi
+		
+		# 检查ACL节点
+		config_foreach check_acl_direct_if_nft acl_rule
+	}
+	
+	# 检查ACL规则中的Direct-IF节点（nftables版本）
+	check_acl_direct_if_nft() {
+		local sid="$1"
+		local enabled tcp_node udp_node
+		
+		config_get enabled "$sid" "enabled" "0"
+		[ "$enabled" = "0" ] && return 0
+		
+		config_get tcp_node "$sid" "tcp_node"
+		config_get udp_node "$sid" "udp_node"
+		
+		if [ -n "$tcp_node" ] && [ "$tcp_node" != "nil" ] && [ "$tcp_node" != "default" ] && [ "$tcp_node" != "tcp" ]; then
+			if [ "$(config_n_get $tcp_node type)" = "Direct-IF" ]; then
+				tcp_proxy "$tcp_node" "" ""
+			fi
+		fi
+		
+		if [ -n "$udp_node" ] && [ "$udp_node" != "nil" ] && [ "$udp_node" != "default" ] && [ "$udp_node" != "tcp" ]; then
+			if [ "$(config_n_get $udp_node type)" = "Direct-IF" ]; then
+				udp_proxy "$udp_node" "" ""
+			fi
+		fi
+	}
+	
+	# 添加全局Direct-IF规则
+	add_direct_if_nft_rules "tcp"
+	add_direct_if_nft_rules "udp"
+	
 	nft "add rule $NFTABLE_NAME PSW_RULE tcp flags &(fin|syn|rst|ack) == syn meta mark set mark and 0x0 xor 0x1 counter"
 	nft "add rule $NFTABLE_NAME PSW_RULE meta l4proto udp ct state new meta mark set mark and 0x0 xor 0x1 counter"
 	nft "add rule $NFTABLE_NAME PSW_RULE ct mark set mark counter"

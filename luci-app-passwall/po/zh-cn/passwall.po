@@ -1896,3 +1896,69 @@ msgstr "可以通过输入 GeoIP/Geosite，提取它们所包含的域名/IP。"
 
 msgid "Use the GeoIP/Geosite query function to verify if the entered Geo rules are correct."
 msgstr "利用 GeoIP/Geosite 查询功能，可以验证输入的 Geo 规则是否正确。"
+
+msgid "Direct Interface"
+msgstr "直连接口"
+
+msgid "Outbound Interface"
+msgstr "出站接口"
+
+msgid "Routing Mark"
+msgstr "路由标记"
+
+msgid "fwmark for policy routing (0x100-0x3FF recommended)"
+msgstr "策略路由标记 (建议使用 0x100-0x3FF)"
+
+msgid "Routing Table ID"
+msgstr "路由表 ID"
+
+msgid "Routing table ID (500-999 recommended). IPv6 table will be +1000 if <1000, otherwise +100"
+msgstr "路由表 ID (建议使用 500-999)。IPv6 表号：小于 1000 时加 1000，否则加 100"
+
+msgid "Source Address"
+msgstr "源地址"
+
+msgid "Optional"
+msgstr "可选"
+
+msgid "IPv6 Support"
+msgstr "IPv6 支持"
+
+msgid "Enable IPv6 support for this interface"
+msgstr "为此接口启用 IPv6 支持"
+
+msgid "Node Remarks"
+msgstr "节点备注"
+
+msgid "Direct"
+msgstr "直连"
+
+msgid "Routing mark must be between 256 (0x100) and 1023 (0x3FF)"
+msgstr "路由标记必须在 256 (0x100) 和 1023 (0x3FF) 之间"
+
+msgid "Routing mark conflicts with another Direct-IF node"
+msgstr "路由标记与另一个直连接口节点冲突"
+
+msgid "Table ID must be between 1 and 65535"
+msgstr "表 ID 必须在 1 和 65535 之间"
+
+msgid "IPv6 table ID would exceed 65535, please use smaller table ID"
+msgstr "IPv6 表 ID 将超过 65535，请使用较小的表 ID"
+
+msgid "Table ID conflicts with another Direct-IF node"
+msgstr "表 ID 与另一个直连接口节点冲突"
+
+msgid "IPv6 table ID conflicts with another Direct-IF node"
+msgstr "IPv6 表 ID 与另一个直连接口节点冲突"
+
+msgid "Table ID conflicts with another node's IPv6 table"
+msgstr "表 ID 与另一个节点的 IPv6 表冲突"
+
+msgid "Provide SOCKS Proxy"
+msgstr "提供 SOCKS 代理"
+
+msgid "Use microsocks to provide SOCKS5 proxy for this Direct-IF node"
+msgstr "使用 microsocks 为此直连接口节点提供 SOCKS5 代理"
+
+msgid "Direct-IF nodes do not require SOCKS port"
+msgstr "直连接口节点不需要 SOCKS 端口"

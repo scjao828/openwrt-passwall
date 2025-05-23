@@ -1,0 +1,48 @@
+#!/bin/sh
+
+# PassWall Direct-IF hotplug 脚本（优化版）
+# 处理动态接口变化
+
+[ "$ACTION" != "ifup" ] && [ "$ACTION" != "ifdown" ] && [ "$ACTION" != "ifupdate" ] && exit 0
+
+# 检查PassWall是否正在运行
+[ ! -f "/var/run/passwall.pid" ] && exit 0
+
+# 加载Direct-IF模块
+APP_PATH=/usr/share/passwall
+CONFIG=passwall
+TMP_PATH=/tmp/etc/$CONFIG
+
+# 加载Direct-IF模块（提供echolog/get_cache_var/config_n_get等函数）
+. $APP_PATH/direct_if.sh
+
+# 检查是否有Direct-IF节点使用该接口并处理
+check_interface_usage() {
+	local interface="$INTERFACE"
+	local affected=0
+	
+	# 使用UCI直接查询，避免遍历所有节点（处理匿名节点@nodes[0]格式）
+	local nodes=$(uci show "$CONFIG" 2>/dev/null | grep "\.type='Direct-IF'" | awk -F'[.=]' '{print $(NF-1)}')
+	
+	for node in $nodes; do
+		local node_interface=$(config_n_get "$node" "interface_name")
+		[ "$node_interface" = "$interface" ] || continue
+		
+		affected=1
+		case "$ACTION" in
+			"ifup"|"ifupdate")
+				echolog "Direct-IF hotplug: 接口 $interface 上线/更新，刷新节点 $node 路由表"
+				refresh_direct_if_routes "$node"
+				;;
+			"ifdown")
+				echolog "Direct-IF hotplug: 接口 $interface 下线，清理节点 $node 路由"
+				cleanup_direct_if "$node"
+				;;
+		esac
+	done
+	
+	return $((1-affected))
+}
+
+# 执行主逻辑
+check_interface_usage

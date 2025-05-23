@@ -303,6 +303,7 @@ o = s:taboption("Main", Value, "tcp_node_socks_port", translate("TCP Node") .. "
 o.default = 1070
 o.datatype = "port"
 o:depends({ tcp_node = "", ["!reverse"] = true })
+o.description = translate("Direct-IF nodes do not require SOCKS port")
 --[[
 if has_singbox or has_xray then
 	o = s:taboption("Main", Value, "tcp_node_http_port", translate("TCP Node") .. " HTTP " .. translate("Listen Port") .. " " .. translate("0 is not use"))
